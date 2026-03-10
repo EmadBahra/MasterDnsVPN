@@ -26,6 +26,11 @@ fi
 INSTALL_DIR="$(pwd)"
 cd "$INSTALL_DIR"
 
+# Check for config file conflicts
+if [ -f "server_config.toml" ] && [ -f "server_config.toml.backup" ]; then
+    log_error "Both 'server_config.toml' and 'server_config.toml.backup' exist! Please delete or move one of them to avoid conflicts, then run the script again."
+fi
+
 # --- Welcome Banner ---
 clear
 echo -e "${MAGENTA}${BOLD}"
@@ -163,8 +168,25 @@ chmod +x "$EXECUTABLE"
 log_header "Configuration"
 
 if [ -f "server_config.toml.backup" ]; then
-    mv -f server_config.toml.backup server_config.toml
-    log_info "Config restored from backup."
+    # Check if CONFIG_VERSION exists in the backup
+    if ! grep -q "^CONFIG_VERSION" server_config.toml.backup; then
+        log_error "Old configuration file detected (CONFIG_VERSION is missing). Please manually move your important settings from 'server_config.toml.backup' to 'server_config.toml' and run the script again."
+    else
+        # Extract the version from the backup file
+        BACKUP_VERSION=$(grep "^CONFIG_VERSION" server_config.toml.backup | awk -F'=' '{print $2}' | tr -d ' "')
+        
+        # Extract the version from the newly downloaded file (default to 1.0 if not found)
+        CURRENT_VERSION=$(grep "^CONFIG_VERSION" server_config.toml | awk -F'=' '{print $2}' | tr -d ' "')
+        [ -z "$CURRENT_VERSION" ] && CURRENT_VERSION="1.0"
+
+        # Compare versions
+        if [ "$BACKUP_VERSION" != "$CURRENT_VERSION" ]; then
+            log_error "Config version mismatch! (Backup: $BACKUP_VERSION, New: $CURRENT_VERSION). Please manually move your important settings from 'server_config.toml.backup' to 'server_config.toml' and run the script again."
+        else
+            mv -f server_config.toml.backup server_config.toml
+            log_info "Config restored from backup."
+        fi
+    fi
 fi
 
 if [ -f "server_config.toml" ] && grep -q '"v.domain.com"' server_config.toml; then

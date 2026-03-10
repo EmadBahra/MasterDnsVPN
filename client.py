@@ -7,6 +7,7 @@ import asyncio
 import ctypes
 import heapq
 import os
+import random
 import signal
 import socket
 import struct
@@ -15,12 +16,9 @@ import time
 from ctypes import wintypes
 from typing import Optional, Tuple
 
-from dns_utils import ARQ, PrependReader
+from dns_utils import ARQ, DNSBalancer, DnsPacketParser, PingManager, PrependReader
 from dns_utils.config_loader import get_config_path, load_config
 from dns_utils.DNS_ENUMS import DNS_Record_Type, Packet_Type
-from dns_utils import DNSBalancer
-from dns_utils import DnsPacketParser
-from dns_utils import PingManager
 from dns_utils.utils import (
     async_recvfrom,
     async_sendto,
@@ -512,350 +510,281 @@ class MasterDnsVPNClient:
         return False, 0
 
     async def _config_recommendations(self):
-
         self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
         self.logger.success(
-            "<fg #ff456d>📢 Don't forget to join our Telegram channel: <cyan>@MasterDNSVPN</cyan> for support, updates, and community discussions! 📢</fg #ff456d>"
+            "<fg #ff456d>📢 Join our Telegram channel: <cyan>@MasterDNSVPN</cyan> for support and updates! 📢</fg #ff456d>"
         )
         self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
-        self.logger.info("<cyan>📊 Config Recommendations:</cyan>")
+        self.logger.info("<cyan>📊 Smart Config Recommendations & Diagnostics:</cyan>")
         self.logger.info(
-            "<yellow>   - <red>NOTE:</red> Configuration is important for best speed, reliability, and performance. You can choose to ignore these suggestions, but we highly recommend following them for optimal performance.</yellow>"
+            "<yellow>Review these suggestions to maximize your speed, stability, and MTU!</yellow>"
         )
 
-        try:
-            suggestion_number = 1
-            not_important_suggestion_number = 1
+        wait_time = 0
+        has_warnings = False
+        has_info = False
 
-            unique_domains = set(self.domains)
-            max_len_domain = max(unique_domains, key=len) if unique_domains else ""
-            if len(unique_domains) > 1:
-                min_domain_len = min(len(d) for d in unique_domains)
-                best_domains = [d for d in unique_domains if len(d) <= min_domain_len]
-                bad_domains = [d for d in unique_domains if d not in best_domains]
-                if best_domains:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> You have multiple domains configured. For optimal MTU performance, we recommend using these domains: <green>"
-                        + ", ".join(best_domains)
-                        + "</green>. Please consider removing these domains from your config: <red>"
-                        + ", ".join(bad_domains)
-                        + "</red>, cause they may reduce the maximum achievable MTU due to longer domain name length.</yellow>"
-                    )
-                    suggestion_number += 1
+        unique_domains = set(self.domains)
+        if len(unique_domains) > 1:
+            min_domain_len = min(len(d) for d in unique_domains)
+            best_domains = [d for d in unique_domains if len(d) <= min_domain_len]
+            self.logger.warning(
+                f"<cyan>🔸 [Domains]:</cyan> <yellow>You have multiple domains. Shorter domains give larger MTU.</yellow>"
+                f"<yellow>Best to keep:</yellow> <green>{', '.join(best_domains)}</green>."
+            )
+            has_warnings = True
 
-            if len(set(self.resolvers)) < 5:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> You have less than <red>5 unique DNS resolvers</red> configured. For better reliability and performance, we recommend adding more resolvers to your config.</yellow>"
+        if len(set(self.resolvers)) < 5:
+            self.logger.warning(
+                "<yellow>🔸 [Resolvers]: Using less than 5 resolvers. Add more for better reliability.</yellow>"
+            )
+            has_warnings = True
+
+        if self.packet_duplication_count > 2:
+            self.logger.warning(
+                f"<yellow>🔸 [Bandwidth]: <cyan>PACKET_DUPLICATION_COUNT</cyan> is <red>{self.packet_duplication_count}</red>. Reduce to <green>1-2</green> to save bandwidth.</yellow>"
+            )
+            self.logger.info(
+                "<cyan>      🔹 [Bandwidth Tip]:</cyan> Higher <cyan>PACKET_DUPLICATION_COUNT</cyan> can improve stability on bad networks but consumes more bandwidth and resolver capacity. Recommended: <green>1</green> for stable, <green>2</green> for unstable connections."
+            )
+            has_warnings = True
+
+        if self.resolver_balancing_strategy != 2:
+            self.logger.info(
+                "<cyan>🔹 [Balancing]:</cyan> Consider using <cyan>RESOLVER_BALANCING_STRATEGY</cyan> = <green>2</green> (Round Robin) for even load distribution."
+            )
+            has_info = True
+
+        if self.protocol_type == "SOCKS5" and self.listener_ip == "0.0.0.0":
+            self.logger.info(
+                "<cyan>🔹 [Security]:</cyan> SOCKS5 is bound to <blue>0.0.0.0</blue>. If local-only, bind to <green>127.0.0.1</green>"
+            )
+
+            has_info = True
+            if not self.socks5_auth and self.listener_ip == "0.0.0.0":
+                self.logger.warning(
+                    "<yellow>🔸 [Security]: <cyan>SOCKS5_AUTH</cyan> is disabled on a public IP! Highly recommended to enable it.</yellow>"
                 )
-                suggestion_number += 1
+                has_warnings = True
 
-            if self.packet_duplication_count > 2:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>PACKET_DUPLICATION_COUNT</cyan> is set to <red>"
-                    + str(self.packet_duplication_count)
-                    + "</red>. Consider reducing it to <green>1-2</green> for better bandwidth efficiency. Higher values increase redundancy but also consume more resolver capacity. Recommended: <green>1</green> for stable networks, <green>2</green> for unstable networks.</yellow>"
+            if (
+                self.socks5_auth
+                and (not self.socks5_user or not self.socks5_pass)
+                and self.listener_ip == "0.0.0.0"
+            ):
+                self.logger.warning(
+                    "<yellow>🔸 [Security]: <cyan>SOCKS5_AUTH</cyan> is enabled but username or password is not set. Please set <cyan>SOCKS5_USER</cyan> and <cyan>SOCKS5_PASS</cyan> in your config for better security.</yellow>"
                 )
-                suggestion_number += 1
-
-            if self.max_packets_per_batch > 5:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>MAX_PACKETS_PER_BATCH</cyan> is set to <red>"
-                    + str(self.max_packets_per_batch)
-                    + "</red>. Consider reducing it to <green>1-5</green> for better performance. This configuration is for the client; the server can have a different value. Higher values can increase latency and reduce performance due to larger batch processing times. Recommended: <green>1-3</green>.</yellow>"
-                )
-                suggestion_number += 1
-
-            if self.resolver_balancing_strategy != 2:
-                strategy_desc = {
-                    0: "Latency-Based (Default)",
-                    1: "Random",
-                    2: "Round Robin",
-                }.get(self.resolver_balancing_strategy, "Unknown")
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your <cyan>RESOLVER_BALANCING_STRATEGY</cyan> is set to <red>"
-                    + strategy_desc
-                    + "</red>. Consider setting it to <green>2 (Round Robin)</green> for more even distribution of requests across resolvers, which can improve performance and reduce the chance of hitting rate limits on individual resolvers.</yellow>"
-                )
-                not_important_suggestion_number += 1
-
-            if self.protocol_type == "SOCKS5" and self.listener_ip == "0.0.0.0":
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your SOCKS5 listener is bound to <red>0.0.0.0</red>. If you are using the VPN only on the same machine or within a secure local network, consider changing <cyan>LISTEN_IP</cyan> to <green>127.0.0.1</green> for better security.</yellow>"
-                )
-                not_important_suggestion_number += 1
-
-                if self.socks5_auth is False:
-                    self.logger.info(
-                        "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                        + str(not_important_suggestion_number)
-                        + "]:</fg #a163eb> Your SOCKS5 <cyan>SOCKS5_AUTH</cyan> is disabled while <cyan>LISTEN_IP</cyan> is set to <red>0.0.0.0</red>. Please enable <cyan>SOCKS5_AUTH</cyan> by setting it to <green>true</green> or bind to <green>127.0.0.1</green> for better security.</yellow>"
-                    )
-                    not_important_suggestion_number += 1
-
-                if self.socks5_auth and (not self.socks5_user or not self.socks5_pass):
-                    self.logger.info(
-                        "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                        + str(not_important_suggestion_number)
-                        + "]:</fg #a163eb> Your SOCKS5 authentication is enabled but username or password is not set. Please set <cyan>SOCKS5_USER</cyan> and <cyan>SOCKS5_PASS</cyan> in your config for better security.</yellow>"
-                    )
-                    not_important_suggestion_number += 1
-
-                if self.socks5_auth and (
+                has_warnings = True
+            elif (
+                self.socks5_auth
+                and self.listener_ip == "0.0.0.0"
+                and (
                     self.socks5_user == "master_dns_vpn"
                     or self.socks5_pass == "master_dns_vpn"
-                ):
-                    self.logger.info(
-                        "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                        + str(not_important_suggestion_number)
-                        + "]:</fg #a163eb> Your SOCKS5 authentication is using the default username and/or password. Please change <cyan>SOCKS5_USER</cyan> and <cyan>SOCKS5_PASS</cyan> to custom values for better security.</yellow>"
+                )
+            ):
+                self.logger.warning(
+                    "<yellow>🔸 [Security]: <cyan>SOCKS5_AUTH</cyan> is using the default username and/or password. Please change <cyan>SOCKS5_USER</cyan> and <cyan>SOCKS5_PASS</cyan> to custom values for better security.</yellow>"
+                )
+                has_warnings = True
+
+            if (
+                self.listener_port in (1080, 1081, 8080, 8000)
+                and self.listener_ip == "0.0.0.0"
+            ):
+                self.logger.warning(
+                    "<yellow>🔸 [Security]: Your SOCKS5 listener is using a common port (<red>"
+                    + str(self.listener_port)
+                    + "</red>). Consider changing <cyan>LISTEN_PORT</cyan> to a less common port like <green>{}</green> for better security through obscurity.</yellow>".format(
+                        random.randint(10000, 65000)
                     )
-                    not_important_suggestion_number += 1
+                )
+                has_warnings = True
 
-                if self.listener_port in (1080, 1081, 8080, 8000):
-                    import random
+        if self.arq_initial_rto > 0.5:
+            self.logger.info(
+                f"<cyan>🔹 [Latency]:</cyan> <cyan>ARQ_INITIAL_RTO</cyan> is <yellow>{self.arq_initial_rto}s</yellow>. Reduce to <green>0.2s-0.5</green>s for faster packet recovery."
+            )
+            has_info = True
 
-                    self.logger.info(
-                        "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                        + str(not_important_suggestion_number)
-                        + "]:</fg #a163eb> Your SOCKS5 listener is using a common port (<red>"
-                        + str(self.listener_port)
-                        + f"</red>). Consider changing <cyan>LISTEN_PORT</cyan> to a less common port like <green>{random.randint(10000, 65000)}</green> for better security through obscurity.</yellow>"
-                    )
-                    not_important_suggestion_number += 1
+        if self.arq_max_rto > 1.5:
+            self.logger.info(
+                f"<cyan>🔹 [Latency]:</cyan> <cyan>ARQ_MAX_RTO</cyan> is <yellow>{self.arq_max_rto}s</yellow>. Keep below <green>1.5</green>s for snappy connections."
+            )
+            has_info = True
 
-            if self.mtu_test_retries > 2:
+        if self.arq_window_size < 3000:
+            self.logger.warning(
+                f"<yellow>🔸 [Throughput]: <cyan>ARQ_WINDOW_SIZE</cyan> is <red>{self.arq_window_size}</red>. Increase to <green>3000</green>+ for high speeds.</yellow>"
+            )
+            has_warnings = True
+
+        if self.max_packets_per_batch > 5:
+            self.logger.warning(
+                f"<yellow>🔸 [Performance]: <cyan>MAX_PACKETS_PER_BATCH</cyan> is set to <red>{self.max_packets_per_batch}</red>. Reduce to <green>1-5</green> for better performance. Higher values can increase latency and reduce performance due to larger batch processing times. Recommended: <green>1-3</green>.</yellow>"
+            )
+            has_warnings = True
+
+        if self.mtu_test_retries > 2:
+            self.logger.info(
+                f"<yellow>🔹 [MTU Testing]: <cyan>MTU_TEST_RETRIES</cyan> is set to <red>{self.mtu_test_retries}</red>. Consider reducing to <green>1-2</green> for faster MTU testing. Higher values can significantly increase startup time.</yellow>"
+            )
+            has_info = True
+
+        if self.mtu_test_timeout > 2.0:
+            self.logger.info(
+                f"<yellow>🔹 [MTU Testing]: <cyan>MTU_TEST_TIMEOUT</cyan> is set to <red>{self.mtu_test_timeout}</red> seconds. Consider reducing to <green>0.5–2</green> seconds for faster MTU testing. A lower timeout can skip slower servers and reduce startup time, while higher values help find optimal MTU on unstable networks. Recommended: <green>0.5–1</green> second for stable networks, <green>2</green> seconds for unstable networks. Note that higher values can significantly increase startup time.</yellow>"
+            )
+            has_info = True
+
+        try:
+            max_len_domain = max(unique_domains, key=len) if unique_domains else ""
+            _, optimal_up_mtu = self.dns_parser.calculate_upload_mtu(
+                domain=max_len_domain, mtu=0
+            )
+
+            self.logger.info("<cyan>📦 --- MTU Limits & Calculations --- 📦</cyan>")
+            self.logger.info(
+                f"<green>   [Upload Limit]:</green> Based on your longest domain name, max theoretical Upload MTU is <green>{optimal_up_mtu}</green> bytes."
+            )
+            min_optimal_mtu = optimal_up_mtu - 5
+            self.logger.info(
+                f"      <fg #acff1c>• Best value for <cyan>MIN_UPLOAD_MTU</cyan> is <green>{min_optimal_mtu} - {optimal_up_mtu}</green> bytes.</fg #acff1c>"
+            )
+            self.logger.info(
+                f"      <fg #acff1c>• Best value for <cyan>MAX_UPLOAD_MTU</cyan> is <green>{optimal_up_mtu}</green> bytes.</fg #acff1c>"
+            )
+            if self.min_upload_mtu < min_optimal_mtu:
+                self.logger.warning(
+                    f"<red>   [MTU Warning]:</red> Your <cyan>MIN_UPLOAD_MTU</cyan> <red>({self.min_upload_mtu})</red> is set very low. Consider increasing it to at least <green>{min_optimal_mtu}</green> bytes for better performance!"
+                )
                 self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>MTU_TEST_RETRIES</cyan> is set to <red>"
-                    + str(self.mtu_test_retries)
-                    + "</red>. Consider reducing it to <green>1-2</green> for faster MTU testing. Decreasing this value can ignore servers with more timeout issues, while higher values can help find the optimal MTU on unstable networks. Recommended: <green>1</green> for stable networks, <green>2</green> for unstable networks. Higher values can increase startup time significantly.</yellow>"
+                    "      • Setting <cyan>MIN_UPLOAD_MTU</cyan> lower than this range will support more resolvers but will decrease your speed."
                 )
-                suggestion_number += 1
-            elif self.mtu_test_retries > 0:
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your <cyan>MTU_TEST_RETRIES</cyan> is set to <green>"
-                    + str(self.mtu_test_retries)
-                    + "</green>. This is good for stability. On a stable network, consider reducing it to <green>1</green> for faster startup—this will select only servers with 0% packet loss during testing, though it may exclude some servers with occasional timeouts. On an unstable network, keeping it at <green>2</green> helps find optimal MTU values even on servers with intermittent issues. Higher values significantly increase startup time.</yellow>"
+            if self.max_upload_mtu > optimal_up_mtu:
+                self.logger.warning(
+                    f"<red>      • [MTU Error]:</red> Your <cyan>MAX_UPLOAD_MTU</cyan> <red>({self.max_upload_mtu})</red> exceeds the theoretical limit based on your domain names <green>({optimal_up_mtu})</green>. Please reduce it!"
                 )
-                not_important_suggestion_number += 1
-
-            if self.mtu_test_timeout > 2.0:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>MTU_TEST_TIMEOUT</cyan> is set to <red>"
-                    + str(self.mtu_test_timeout)
-                    + "</red> seconds. Consider reducing it to <green>0.5–2 seconds</green> for faster MTU testing. A lower timeout can skip slower servers and reduce startup time, while higher values help find optimal MTU on unstable networks. Recommended: <green>0.5–1 second</green> for stable networks, <green>2 seconds</green> for unstable networks. Note that higher values can significantly increase startup time.</yellow>"
+            if self.min_upload_mtu > self.max_upload_mtu:
+                self.logger.warning(
+                    f"<red>      • [MTU Error]:</red> Your <cyan>MIN_UPLOAD_MTU</cyan> <red>({self.min_upload_mtu})</red> is greater than your <cyan>MAX_UPLOAD_MTU</cyan> <red>({self.max_upload_mtu})</red>. Please fix this!"
                 )
-                suggestion_number += 1
-            elif self.mtu_test_timeout > 1.0:
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your <cyan>MTU_TEST_TIMEOUT</cyan> is set to <green>"
-                    + str(self.mtu_test_timeout)
-                    + "</green> seconds. Consider reducing it to <green>0.5–1 second</green> for faster startup. A lower timeout can skip slower servers and reduce startup time, while higher values help find optimal MTU on unstable networks. Recommended: <green>0.5–1 second</green> for stable networks, <green>2 seconds</green> for unstable networks. Note that higher values can significantly increase startup time; however, you may ignore most servers.</yellow>"
-                )
-                not_important_suggestion_number += 1
-
-            if self.arq_window_size < 3000:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>ARQ_WINDOW_SIZE</cyan> is set to <red>"
-                    + str(self.arq_window_size)
-                    + "</red>. Consider increasing it to at least <green>3000</green> for better performance. You can decrease this value to reduce memory usage, but it may cause more packet drops and reduce performance on high-latency or unstable networks. Recommended: <green>3000</green> for most users; lower values for low-memory environments.</yellow>"
-                )
-                suggestion_number += 1
-
-            if self.arq_initial_rto > 1.0:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>ARQ_INITIAL_RTO</cyan> is set to <red>"
-                    + str(self.arq_initial_rto)
-                    + "</red> seconds. Consider reducing it to <green>0.2 - 1 second</green> for better performance. A lower initial RTO can speed up recovery from packet loss, while higher values may help on very unstable networks but can increase latency. Recommended: <green>0.2-0.5 second</green> for stable networks, <green>1 second</green> for unstable networks.</yellow>"
-                )
-                suggestion_number += 1
-            elif self.arq_initial_rto > 0.5:
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your <cyan>ARQ_INITIAL_RTO</cyan> is set to <green>"
-                    + str(self.arq_initial_rto)
-                    + "</green> seconds. Consider reducing it to <green>0.2 - 0.5 second</green> for maximum performance. A lower initial RTO can speed up recovery from packet loss, while higher values may help on very unstable networks but can increase latency. Recommended: <green>0.2-0.5 second</green> for stable networks, <green>1 second</green> for unstable networks.</yellow>"
-                )
-                not_important_suggestion_number += 1
-
-            if self.arq_max_rto > 1.5:
-                self.logger.info(
-                    "<yellow>   - <magenta>[Suggestion "
-                    + str(suggestion_number)
-                    + "]:</magenta> Your <cyan>ARQ_MAX_RTO</cyan> is set to <red>"
-                    + str(self.arq_max_rto)
-                    + "</red> seconds. Consider reducing it to <green>1-1.5 seconds</green> for better performance. A lower max RTO can speed up recovery from packet loss, while higher values may help on very unstable networks but can increase latency. Recommended: <green>1-1.5 seconds</green> for most users; lower values for stable networks, higher values for very unstable networks.</yellow>"
-                )
-                suggestion_number += 1
-            elif self.arq_max_rto > 1.0:
-                self.logger.info(
-                    "<yellow>   - <fg #a163eb>[Not Important Suggestion "
-                    + str(not_important_suggestion_number)
-                    + "]:</fg #a163eb> Your <cyan>ARQ_MAX_RTO</cyan> is set to <green>"
-                    + str(self.arq_max_rto)
-                    + "</green> seconds. Consider reducing it to <green>1 second</green> for maximum performance. A lower max RTO can speed up recovery from packet loss, while higher values may help on very unstable networks but can increase latency. Recommended: <green>1-1.5 seconds</green> for most users; lower values for stable networks, higher values for very unstable networks.</yellow>"
-                )
-                not_important_suggestion_number += 1
-
-            try:
-                _, max_up_bytes = self.dns_parser.calculate_upload_mtu(
-                    domain=max_len_domain, mtu=0
+            if self.min_upload_mtu > optimal_up_mtu:
+                self.logger.warning(
+                    f"<red>      • [MTU Warning]:</red> Your <cyan>MIN_UPLOAD_MTU</cyan> <red>({self.min_upload_mtu})</red> is set higher than the optimal range based on your domain names <green>({optimal_up_mtu})</green>. This may cause MTU testing to fail. Consider reducing it to at most <green>{optimal_up_mtu}</green> bytes!"
                 )
 
-                optimal_up_mtu = max_up_bytes
-
-                if optimal_up_mtu < 90:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Based on your longest domain name, the maximum achievable upload MTU is estimated to be around <red>"
-                        + str(optimal_up_mtu)
-                        + "</red> bytes, which is quite low. Consider using shorter domain names in your configuration to improve performance, as longer domain names can significantly reduce the maximum achievable MTU.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                suggest_min_up_mtu = optimal_up_mtu - 3
-                if self.min_upload_mtu < suggest_min_up_mtu:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Based on the estimated maximum upload MTU of <cyan>"
-                        + str(optimal_up_mtu)
-                        + "</cyan> bytes, consider setting <cyan>MIN_UPLOAD_MTU</cyan> to around <green>"
-                        + str(suggest_min_up_mtu)
-                        + " - "
-                        + str(optimal_up_mtu)
-                        + "</green> bytes. This can help ensure you get the best performance while avoiding servers with very low MTU limits.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                if self.max_upload_mtu > optimal_up_mtu:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Based on the estimated maximum upload MTU of <cyan>"
-                        + str(optimal_up_mtu)
-                        + "</cyan> bytes, consider setting <cyan>MAX_UPLOAD_MTU</cyan> to around <green>"
-                        + str(suggest_min_up_mtu)
-                        + " - "
-                        + str(optimal_up_mtu)
-                        + "</green> bytes. Setting it higher than the estimated maximum may lead to more failed connections during MTU testing, as some servers may drop packets that exceed their MTU limits.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                if self.min_upload_mtu > optimal_up_mtu:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Your current <cyan>MIN_UPLOAD_MTU</cyan> of <red>"
-                        + str(self.min_upload_mtu)
-                        + "</red> bytes is higher than the estimated maximum upload MTU of <cyan>"
-                        + str(optimal_up_mtu)
-                        + "</cyan> bytes based on your longest domain name. Consider reducing <cyan>MIN_UPLOAD_MTU</cyan> to around <green>"
-                        + str(suggest_min_up_mtu)
-                        + " - "
-                        + str(optimal_up_mtu)
-                        + "</green> bytes to improve the chances of successful connections and better performance.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                if self.max_upload_mtu < optimal_up_mtu:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Your current <cyan>MAX_UPLOAD_MTU</cyan> of <red>"
-                        + str(self.max_upload_mtu)
-                        + "</red> bytes is lower than the estimated maximum upload MTU of <cyan>"
-                        + str(optimal_up_mtu)
-                        + "</cyan> bytes based on your longest domain name. Consider increasing <cyan>MAX_UPLOAD_MTU</cyan> to around <green>"
-                        + str(suggest_min_up_mtu)
-                        + " - "
-                        + str(optimal_up_mtu)
-                        + "</green> bytes to allow for better performance, as some servers may support higher MTU limits.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                if self.min_upload_mtu > self.max_upload_mtu:
-                    self.logger.info(
-                        "<yellow>   - <magenta>[Suggestion "
-                        + str(suggestion_number)
-                        + "]:</magenta> Your current <cyan>MIN_UPLOAD_MTU</cyan> of <red>"
-                        + str(self.min_upload_mtu)
-                        + "</red> bytes is higher than your current <cyan>MAX_UPLOAD_MTU</cyan> of <red>"
-                        + str(self.max_upload_mtu)
-                        + "</red> bytes. This configuration will cause all MTU tests to fail, as the minimum MTU cannot be greater than the maximum MTU. Consider adjusting these values to ensure that <cyan>MIN_UPLOAD_MTU</cyan> is less than or equal to <cyan>MAX_UPLOAD_MTU</cyan>.</yellow>"
-                    )
-                    suggestion_number += 1
-
-                self.max_upload_mtu = min(self.max_upload_mtu, optimal_up_mtu)
-                self.min_upload_mtu = min(self.min_upload_mtu, self.max_upload_mtu)
-
-            except Exception as _:
-                pass
-            wait_time = 0
-            if not_important_suggestion_number == 1:
-                self.logger.info(
-                    "<green>   - No specific non-critical recommendations based on your current configuration. You are good to go! 🚀</green>"
+            if optimal_up_mtu < 80:
+                self.logger.warning(
+                    f"<yellow>      • [Warning]: Your domain names are quite long, which significantly reduces your maximum Upload MTU to <red>{optimal_up_mtu}</red> bytes. Consider using shorter domain names for better performance.</yellow>"
                 )
-            else:
+
+            # Max DNS Overhead = Header(12) + MaxQuestion(257) + AnswerHeader(12) + TXTOverhead(2) = 283
+            dns_overhead = 283
+
+            def calc_down_capacity(dns_limit):
+                available = dns_limit - dns_overhead
+                if available <= 0:
+                    return 0
+                if self.base_encode_responses:
+                    raw_cap = int(
+                        available * 0.75
+                    )  # Base64 inflation (4 chars per 3 bytes)
+                else:
+                    raw_cap = available
+                return max(0, raw_cap - self.crypto_overhead - 8)  # 8 for VPN header
+
+            down_512 = calc_down_capacity(512)
+            min_down_512 = max(0, down_512 - 10)
+            down_1232 = calc_down_capacity(1232)
+            min_down_1232 = max(0, down_1232 - 50)
+            down_4096 = calc_down_capacity(4096)
+            min_down_4096 = max(0, down_4096 - 100)
+
+            mode_str = "Base64 (Encoded)" if self.base_encode_responses else "Raw Bytes"
+            self.logger.info(
+                f"<green>   [Download Limits]:</green> For a single Answer in <cyan>{mode_str}</cyan> mode:"
+            )
+            self.logger.info(
+                f"      • <yellow>No EDNS0 (512 limit):</yellow> <cyan>MAX_DOWNLOAD_MTU</cyan> ~<green>{down_512}</green> and <cyan>MIN_DOWNLOAD_MTU</cyan> ~<green>{min_down_512}</green>"
+            )
+            self.logger.info(
+                f"      • <yellow>Safe EDNS0 (1232 limit):</yellow> <cyan>MAX_DOWNLOAD_MTU</cyan> ~<green>{down_1232}</green> and <cyan>MIN_DOWNLOAD_MTU</cyan> ~<green>{min_down_1232}</green> bytes"
+            )
+            self.logger.info(
+                f"      • <yellow>Max EDNS0 (4096 limit):</yellow> <cyan>MAX_DOWNLOAD_MTU</cyan> ~<green>{down_4096}</green> and <cyan>MIN_DOWNLOAD_MTU</cyan> ~<green>{min_down_4096}</green> bytes"
+            )
+            self.logger.info(
+                f"      • Note: You can try <cyan>MIN_DOWNLOAD_MTU</cyan> = <green>{min_down_512}</green> and <cyan>MAX_DOWNLOAD_MTU</cyan> = <green>{down_4096}</green>, but if your network blocks EDNS0, you'll get better performance by setting <cyan>MAX_DOWNLOAD_MTU</cyan> to <green>{down_512}</green>."
+            )
+
+            if self.min_download_mtu < 100:
+                self.logger.warning(
+                    f"<red>      • [MTU Warning]:</red> Your <cyan>MIN_DOWNLOAD_MTU</cyan> ({self.min_download_mtu}) is set very low. Consider increasing it to at least <green>{min_down_512}</green> bytes for better performance!"
+                )
+
+            if self.max_download_mtu > down_4096:
+                self.logger.warning(
+                    f"<red>      • [MTU Error]:</red> Your <cyan>MAX_DOWNLOAD_MTU</cyan> ({self.max_download_mtu}) exceeds the absolute DNS limits ({down_4096}). Please reduce it!"
+                )
                 wait_time += 5
-
-            if suggestion_number == 1:
+                has_warnings = True
+            elif self.max_download_mtu > down_512:
                 self.logger.info(
-                    "<green>   - No specific recommendations based on your current configuration. You are good to go! 🚀</green>"
+                    f"<cyan>      • [MTU Tip]:</cyan> If your network drops packets and MTU tests fail, it means EDNS0 is blocked. Lower <cyan>MAX_DOWNLOAD_MTU</cyan> to <green>{down_512}</green>."
                 )
-            else:
-                wait_time += 10
 
+            self.max_upload_mtu = min(self.max_upload_mtu, optimal_up_mtu)
+            self.min_upload_mtu = min(self.min_upload_mtu, self.max_upload_mtu)
+
+        except Exception as e:
+            self.logger.debug(f"Failed to calculate MTU bounds: {e}")
+
+        self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
+        if self.base_encode_responses:
+            self.logger.info(
+                "<cyan>🔹 [Encoding Mode]:</cyan> <cyan>BASE_ENCODE_DATA</cyan> is <green>enabled</green>. "
+                "<fg #acff1c>Pros:</fg #acff1c> Most resolvers support it. "
+                "<fg #ff6b6b>Cons:</fg #ff6b6b> ~33% overhead reduces max Download MTU."
+            )
+        else:
+            self.logger.info(
+                "<cyan>🔹 [Encoding Mode]:</cyan> <cyan>BASE_ENCODE_DATA</cyan> is <red>disabled</red>. "
+                "<fg #acff1c>Pros:</fg #acff1c> Larger Download MTU, higher performance. "
+                "<fg #ff6b6b>Cons:</fg #ff6b6b> Some resolvers may reject raw binary data."
+            )
+
+        if has_warnings:
+            wait_time += 5
+        if has_info:
+            wait_time += 3
+
+        if wait_time > 0:
             try:
                 self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
                 self.logger.success(
-                    "<fg #ff456d>📢 Don't forget to join our Telegram channel: <cyan>@MasterDNSVPN</cyan> for support, updates, and community discussions! 📢</fg #ff456d>"
+                    "<fg #ff456d>📢 Join our Telegram channel: <cyan>@MasterDNSVPN</cyan> for support and updates! 📢</fg #ff456d>"
                 )
                 self.logger.info("<yellow>" + "=" * 80 + "</yellow>")
                 self.logger.info(
-                    f"<fg #e8a251>Waiting for <cyan>{wait_time}</cyan> seconds before starting MTU tests...</fg #e8a251>"
+                    f"<fg #e8a251>Waiting <cyan>{wait_time}</cyan> seconds so you can read the warnings above...</fg #e8a251>"
                 )
                 self.logger.info(
                     "<fg #51e8bd>Press <green>ENTER</green> key to skip the wait and start immediately...</fg #51e8bd>"
                 )
-
                 self.logger.info(
-                    "<fg #e85151>You can press <cyan>CTRL+C</cyan> to stop the client at any time. "
-                    "After stopping, review the suggestions, fix your configuration, and run the program again!</fg #e85151>"
+                    "<fg #e85151>Or press <cyan>CTRL+C</cyan> to stop and fix your configuration!</fg #e85151>"
                 )
                 await asyncio.wait_for(
                     self.loop.run_in_executor(None, input), timeout=wait_time
                 )
-            except Exception as _:
+            except Exception:
                 pass
-
-        except Exception as e:
-            self.logger.debug(f"Failed to calculate stealth MTU: {e}")
+        else:
+            self.logger.success(
+                "\n<green>✅ Your configuration looks great! No critical warnings found. 🚀</green>"
+            )
 
     async def test_mtu_sizes(self) -> bool:
 
