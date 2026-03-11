@@ -833,12 +833,10 @@ class DnsPacketParser:
         is_chunked = False
 
         answers = parsed_packet.get("answers", [])
-        is_multi = len(answers) > 1
+        txt_answers = [a for a in answers if a.get("type") == DNS_Record_Type.TXT]
+        is_multi = len(txt_answers) > 1
 
-        for answer in answers:
-            if answer.get("type") != DNS_Record_Type.TXT:
-                continue
-
+        for answer in txt_answers:
             raw_txt = self.extract_txt_from_rData_bytes(answer["rData"])
             if not raw_txt:
                 continue
