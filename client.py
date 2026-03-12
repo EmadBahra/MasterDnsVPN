@@ -103,6 +103,20 @@ class MasterDnsVPNClient(PacketQueueMixin):
         self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
         self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
         self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
+        self.save_mtu_servers_to_file: bool = bool(
+            self.config.get("SAVE_MTU_SERVERS_TO_FILE", False)
+        )
+        self.mtu_servers_file_name: str = str(
+            self.config.get(
+                "MTU_SERVERS_FILE_NAME", "masterdnsvpn_success_test_{time}.log"
+            )
+        )
+        self.mtu_servers_file_format: str = str(
+            self.config.get(
+                "MTU_SERVERS_FILE_FORMAT",
+                "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}",
+            )
+        )
         self.max_packets_per_batch: int = int(
             self.config.get("MAX_PACKETS_PER_BATCH", 3)
         )
@@ -916,6 +930,107 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 "\n<green>✅ Your configuration looks great! No critical warnings found. 🚀</green>"
             )
 
+    def _resolve_mtu_success_output_path(self) -> str:
+        if not self.save_mtu_servers_to_file:
+            return ""
+
+        raw_name = (self.mtu_servers_file_name or "").strip()
+        if not raw_name:
+            self.logger.warning(
+                "<yellow>MTU result saving is enabled, but MTU_SERVERS_FILE_NAME is empty.</yellow>"
+            )
+            return ""
+
+        if "{time}" in raw_name:
+            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            base_name = raw_name.replace("{time}", "").strip()
+            if not base_name:
+                base_name = "masterdnsvpn_success_test"
+
+            root, ext = os.path.splitext(base_name)
+            if not root:
+                root = base_name
+            if not ext:
+                ext = ".log"
+
+            raw_name = f"{root}_{ts}{ext}"
+
+        return os.path.abspath(raw_name)
+
+    def _prepare_mtu_success_output_file(self) -> str:
+        output_path = self._resolve_mtu_success_output_path()
+        if not output_path:
+            return ""
+
+        try:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            # Rewrite file from scratch at test start.
+            with open(output_path, "w", encoding="utf-8"):
+                pass
+
+            self.logger.info(
+                f"<blue>[MTU]</blue> Success output file initialized: <cyan>{output_path}</cyan>"
+            )
+            return output_path
+        except Exception as e:
+            self.logger.warning(
+                f"<yellow>[MTU]</yellow> Failed to initialize output file <cyan>{output_path}</cyan>: {e}"
+            )
+            return ""
+
+    def _format_mtu_success_line(self, connection: dict) -> str:
+        template = (
+            self.mtu_servers_file_format or "{IP} - UP: {UP_MTU} DOWN: {DOWN-MTU}"
+        )
+
+        ip_value = str(connection.get("resolver", ""))
+        up_mtu_value = str(connection.get("upload_mtu_bytes", 0))
+        down_mtu_value = str(connection.get("download_mtu_bytes", 0))
+        up_chars_value = str(connection.get("upload_mtu_chars", 0))
+        domain_value = str(connection.get("domain", ""))
+
+        line = str(template)
+        replacements = {
+            "{IP}": ip_value,
+            "{ip}": ip_value,
+            "{RESOLVER}": ip_value,
+            "{resolver}": ip_value,
+            "{UP_MTU}": up_mtu_value,
+            "{up_mtu}": up_mtu_value,
+            "{DOWN_MTU}": down_mtu_value,
+            "{down_mtu}": down_mtu_value,
+            "{DOWN-MTU}": down_mtu_value,
+            "{down-mtu}": down_mtu_value,
+            "{UP_MTU_CHARS}": up_chars_value,
+            "{up_mtu_chars}": up_chars_value,
+            "{DOMAIN}": domain_value,
+            "{domain}": domain_value,
+            "{TIME}": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "{time}": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+
+        for token, value in replacements.items():
+            line = line.replace(token, value)
+
+        return line
+
+    def _append_mtu_success_line(self, output_path: str, connection: dict) -> None:
+        if not output_path:
+            return
+
+        try:
+            line = self._format_mtu_success_line(connection).rstrip("\r\n") + "\n"
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+        except Exception as e:
+            self.logger.warning(
+                f"<yellow>[MTU]</yellow> Failed to append MTU success line: {e}"
+            )
+
     async def test_mtu_sizes(self) -> bool:
 
         try:
@@ -928,6 +1043,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
 
         server_id = 0
         total_conns = len(self.connections_map)
+        mtu_output_path = self._prepare_mtu_success_output_file()
 
         for connection in self.connections_map:
             if self.should_stop.is_set():
@@ -993,6 +1109,8 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 f"<green>✅ Valid: {domain} via <green>{resolver}</green> | "
                 f"Upload MTU: <cyan>{up_mtu_bytes}</cyan> | Download MTU: <cyan>{down_mtu_bytes}</cyan> - (<green>V: {valid_count}</green>, <red>E: {errors_count}</red>, <yellow>{server_id} / {total_conns}</yellow>)</green>"
             )
+
+            self._append_mtu_success_line(mtu_output_path, connection)
 
         valid_conns = [c for c in self.connections_map if c.get("is_valid")]
         if not valid_conns:
