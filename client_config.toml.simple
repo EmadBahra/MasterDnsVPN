@@ -96,7 +96,12 @@ MAX_DOWNLOAD_MTU = 200
 MTU_TEST_RETRIES = 2
 MTU_TEST_TIMEOUT = 2.0
 
+# Auto profile scaling by resolver-domain count (small/medium/large).
+# If true, runtime tuning for MTU/recheck is adjusted automatically.
+AUTO_SCALE_PROFILES = true
+
 # Number of resolver-domain pairs tested in parallel during initial MTU scan.
+# Note: when AUTO_SCALE_PROFILES=true, runtime value is auto-tuned by list size.
 # Higher values speed up startup but increase temporary CPU/network usage.
 MTU_TEST_PARALLELISM = 10
 
@@ -152,6 +157,10 @@ RECHECK_INACTIVE_INTERVAL_SECONDS = 1800
 # Delay between testing two inactive servers in background mode.
 # Minimum is always enforced as 3 seconds.
 RECHECK_SERVER_INTERVAL_SECONDS = 3.0
+
+# Number of inactive resolver-domain pairs checked per background recheck cycle.
+# Note: when AUTO_SCALE_PROFILES=true, runtime value is auto-tuned by list size.
+RECHECK_BATCH_SIZE = 5
 
 # ------------------------------------------------------------------------------
 # 5) ARQ / Reliability

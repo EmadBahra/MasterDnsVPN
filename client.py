@@ -124,6 +124,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
         self.min_download_mtu: int = self.config.get("MIN_DOWNLOAD_MTU", 0)
         self.mtu_test_retries: int = self.config.get("MTU_TEST_RETRIES", 2)
         self.mtu_test_timeout: float = float(self.config.get("MTU_TEST_TIMEOUT", 1.0))
+        self.auto_scale_profiles: bool = bool(
+            self.config.get("AUTO_SCALE_PROFILES", True)
+        )
         self.mtu_test_parallelism: int = max(
             1, int(self.config.get("MTU_TEST_PARALLELISM", 10))
         )
@@ -171,6 +174,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
         )
         self.recheck_server_interval_seconds: float = max(
             3.0, float(self.config.get("RECHECK_SERVER_INTERVAL_SECONDS", 3.0))
+        )
+        self.recheck_batch_size: int = max(
+            1, int(self.config.get("RECHECK_BATCH_SIZE", 5))
         )
         self.max_packets_per_batch: int = int(
             self.config.get("MAX_PACKETS_PER_BATCH", 100)
@@ -323,8 +329,49 @@ class MasterDnsVPNClient(PacketQueueMixin):
         # ---------------------------------------------------------
         self.config_version = self.config.get("CONFIG_VERSION", 0.1)
         self.min_config_version = 3.0
+        self.scale_profile_name = "manual"
 
         self.logger.debug("<magenta>[INIT]</magenta> MasterDnsVPNClient initialized.")
+
+    def _apply_scale_profile(self, total_pairs: int) -> None:
+        """Apply runtime tuning profile based on resolver-domain pair count."""
+        if not self.auto_scale_profiles:
+            self.scale_profile_name = "manual"
+            return
+
+        n = max(1, int(total_pairs))
+        if n <= 50:
+            profile = "small"
+            mtu_parallel = 10
+            batch_size = 4
+            recheck_interval = 600.0
+            per_server_gap = 2.5
+        elif n <= 1000:
+            profile = "medium"
+            mtu_parallel = 12
+            batch_size = 5
+            recheck_interval = 900.0
+            per_server_gap = 3.0
+        else:
+            profile = "large"
+            mtu_parallel = 16
+            batch_size = 8
+            recheck_interval = 1200.0
+            per_server_gap = 4.0
+
+        self.scale_profile_name = profile
+        self.mtu_test_parallelism = max(1, mtu_parallel)
+        self.recheck_batch_size = max(1, batch_size)
+        self.recheck_inactive_interval_seconds = max(60.0, float(recheck_interval))
+        self.recheck_server_interval_seconds = max(1.0, float(per_server_gap))
+
+        self.logger.info(
+            f"<cyan>🔸 [Scale Profile: <green>{self.scale_profile_name}</green>]: "
+            f"MTU_TEST_PARALLELISM: <green>{self.mtu_test_parallelism}</green> | "
+            f"RECHECK_BATCH_SIZE: <green>{self.recheck_batch_size}</green> | "
+            f"RECHECK_INACTIVE_INTERVAL_SECONDS: <green>{int(self.recheck_inactive_interval_seconds)}</green> | "
+            f"RECHECK_SERVER_INTERVAL_SECONDS: <green>{self.recheck_server_interval_seconds:.1f}</green></cyan>"
+        )
 
     # ---------------------------------------------------------
     # Connection Management
@@ -343,6 +390,7 @@ class MasterDnsVPNClient(PacketQueueMixin):
             for resolver in unique_resolvers:
                 conn = {"domain": domain, "resolver": resolver}
                 conn["_key"] = self._get_connection_key(conn)
+                self._init_recheck_meta(conn)
                 self.connections_map.append(conn)
 
     def _get_connection_key(self, connection: dict) -> str:
@@ -351,6 +399,36 @@ class MasterDnsVPNClient(PacketQueueMixin):
         key = f"{resolver}:{domain}"
         connection["_key"] = key
         return key
+
+    def _init_recheck_meta(self, connection: dict) -> None:
+        connection.setdefault("_recheck_fail_count", 0)
+        connection.setdefault("_recheck_next_at", 0.0)
+        connection.setdefault("_was_valid_once", False)
+
+    def _schedule_recheck_after_failure(
+        self, connection: dict, runtime_priority: bool
+    ) -> None:
+        self._init_recheck_meta(connection)
+        fails = int(connection.get("_recheck_fail_count", 0)) + 1
+        connection["_recheck_fail_count"] = fails
+
+        if runtime_priority:
+            base = max(10.0, self.recheck_server_interval_seconds * 2.0)
+        else:
+            base = max(30.0, self.recheck_inactive_interval_seconds * 0.25)
+
+        delay = min(
+            self.recheck_inactive_interval_seconds,
+            base * (1.8 ** min(fails, 6)),
+        )
+        jitter = random.uniform(0.0, min(2.0, delay * 0.15))
+        next_at = time.monotonic() + delay + jitter
+        connection["_recheck_next_at"] = next_at
+
+        key = self._get_connection_key(connection)
+        if runtime_priority and key in self.runtime_disabled_servers:
+            self.runtime_disabled_servers[key]["next_retry_at"] = next_at
+            self.runtime_disabled_servers[key]["retry_count"] = fails
 
     def _format_mtu_log_line(
         self,
@@ -516,10 +594,20 @@ class MasterDnsVPNClient(PacketQueueMixin):
             return False
 
         connection["is_valid"] = False
+        self._init_recheck_meta(connection)
+        connection["_was_valid_once"] = True
+        connection["_recheck_next_at"] = time.monotonic() + max(
+            5.0, self.recheck_server_interval_seconds * 2.0
+        )
+        connection["_recheck_fail_count"] = max(
+            0, int(connection.get("_recheck_fail_count", 0))
+        )
         key = self._get_connection_key(connection)
         self.runtime_disabled_servers[key] = {
             "disabled_at": time.monotonic(),
             "cause": str(cause),
+            "next_retry_at": connection["_recheck_next_at"],
+            "retry_count": int(connection.get("_recheck_fail_count", 0)),
         }
         self._reset_server_runtime_state(key)
         self._refresh_balancer_valid_servers()
@@ -542,6 +630,10 @@ class MasterDnsVPNClient(PacketQueueMixin):
         key = self._get_connection_key(connection)
         self.runtime_disabled_servers.pop(key, None)
         self._reset_server_runtime_state(key)
+        self._init_recheck_meta(connection)
+        connection["_recheck_fail_count"] = 0
+        connection["_recheck_next_at"] = 0.0
+        connection["_was_valid_once"] = True
         connection["is_valid"] = True
         self._refresh_balancer_valid_servers()
 
@@ -1039,11 +1131,14 @@ class MasterDnsVPNClient(PacketQueueMixin):
             )
             has_warnings = True
 
+        all_resolvers = len(self.connections_map)
+
         if len(set(self.resolvers)) < 5:
             self.logger.warning(
                 "<yellow>🔸 [Resolvers]: Using less than 5 resolvers. Add more for better reliability.</yellow>"
             )
             has_warnings = True
+        self._apply_scale_profile(all_resolvers)
 
         if self.packet_duplication_count > 2:
             self.logger.warning(
@@ -1381,11 +1476,15 @@ class MasterDnsVPNClient(PacketQueueMixin):
         for connection in self.connections_map:
             if not connection:
                 continue
+            self._init_recheck_meta(connection)
             connection["is_valid"] = False
             connection["upload_mtu_bytes"] = 0
             connection["upload_mtu_chars"] = 0
             connection["download_mtu_bytes"] = 0
             connection["packet_loss"] = 100
+            connection["_recheck_fail_count"] = 0
+            connection["_was_valid_once"] = False
+            connection["_recheck_next_at"] = 0.0
 
         sem = asyncio.Semaphore(max(1, self.mtu_test_parallelism))
         counters = {
@@ -1419,6 +1518,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 if not up_valid or (
                     self.min_upload_mtu > 0 and up_mtu_bytes < self.min_upload_mtu
                 ):
+                    connection["_recheck_next_at"] = (
+                        time.monotonic() + self.recheck_inactive_interval_seconds
+                    )
                     async with counters_lock:
                         counters["completed"] += 1
                         counters["reject_upload"] += 1
@@ -1439,6 +1541,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 if not down_valid or (
                     self.min_download_mtu > 0 and down_mtu_bytes < self.min_download_mtu
                 ):
+                    connection["_recheck_next_at"] = (
+                        time.monotonic() + self.recheck_inactive_interval_seconds
+                    )
                     async with counters_lock:
                         counters["completed"] += 1
                         counters["reject_download"] += 1
@@ -1457,6 +1562,9 @@ class MasterDnsVPNClient(PacketQueueMixin):
                 connection["upload_mtu_chars"] = up_mtu_char
                 connection["download_mtu_bytes"] = down_mtu_bytes
                 connection["packet_loss"] = 0
+                connection["_recheck_fail_count"] = 0
+                connection["_recheck_next_at"] = 0.0
+                connection["_was_valid_once"] = True
 
                 async with counters_lock:
                     counters["completed"] += 1
@@ -1580,43 +1688,83 @@ class MasterDnsVPNClient(PacketQueueMixin):
                     continue
 
                 now = time.monotonic()
-                if self.next_inactive_recheck_at <= 0.0:
-                    base = self.initial_mtu_scan_finished_at or now
-                    self.next_inactive_recheck_at = (
-                        base + self.recheck_inactive_interval_seconds
-                    )
-
-                wait_time = self.next_inactive_recheck_at - now
-                if wait_time > 0:
-                    await self._sleep(min(wait_time, 5.0))
-                    continue
-
                 inactive_conns = [
                     c for c in self.connections_map if not c.get("is_valid", False)
                 ]
                 if not inactive_conns:
                     self.next_inactive_recheck_at = (
-                        time.monotonic() + self.recheck_inactive_interval_seconds
+                        now + self.recheck_inactive_interval_seconds
                     )
                     continue
 
+                for conn in inactive_conns:
+                    self._init_recheck_meta(conn)
+
+                runtime_priority = []
+                normal_candidates = []
+                for conn in inactive_conns:
+                    key = self._get_connection_key(conn)
+                    due_at = float(conn.get("_recheck_next_at", 0.0) or 0.0)
+                    if now < due_at:
+                        continue
+
+                    if key in self.runtime_disabled_servers:
+                        runtime_priority.append(conn)
+                    else:
+                        normal_candidates.append(conn)
+
+                if not runtime_priority and not normal_candidates:
+                    await self._sleep(min(5.0, self.recheck_server_interval_seconds))
+                    continue
+
+                runtime_priority.sort(
+                    key=lambda c: (
+                        float(
+                            self.runtime_disabled_servers.get(
+                                c.get("_key", ""), {}
+                            ).get("next_retry_at", 0.0)
+                        ),
+                        int(c.get("_recheck_fail_count", 0)),
+                    )
+                )
+                normal_candidates.sort(
+                    key=lambda c: (
+                        int(c.get("_recheck_fail_count", 0)),
+                        float(c.get("_recheck_next_at", 0.0)),
+                    )
+                )
+
+                selected = runtime_priority[: self.recheck_batch_size]
+                remaining_slots = max(0, self.recheck_batch_size - len(selected))
+                if remaining_slots > 0:
+                    selected.extend(normal_candidates[:remaining_slots])
+
                 self.background_mtu_recheck_mode = True
                 try:
-                    for idx, conn in enumerate(inactive_conns):
+                    for idx, conn in enumerate(selected):
                         if (
                             self.should_stop.is_set()
                             or self.session_restart_event.is_set()
                         ):
                             break
 
-                        await self._recheck_one_inactive_connection(conn)
+                        ok = await self._recheck_one_inactive_connection(conn)
+                        key = self._get_connection_key(conn)
+                        if not ok:
+                            self._schedule_recheck_after_failure(
+                                conn,
+                                runtime_priority=(key in self.runtime_disabled_servers),
+                            )
+                        else:
+                            conn["_recheck_fail_count"] = 0
+                            conn["_recheck_next_at"] = 0.0
 
-                        if idx < len(inactive_conns) - 1:
+                        if idx < len(selected) - 1:
                             await self._sleep(self.recheck_server_interval_seconds)
                 finally:
                     self.background_mtu_recheck_mode = False
-                    self.next_inactive_recheck_at = (
-                        time.monotonic() + self.recheck_inactive_interval_seconds
+                    self.next_inactive_recheck_at = time.monotonic() + min(
+                        5.0, max(1.0, self.recheck_server_interval_seconds)
                     )
             except asyncio.CancelledError:
                 break
